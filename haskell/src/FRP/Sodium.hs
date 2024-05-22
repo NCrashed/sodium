@@ -36,16 +36,16 @@
 module FRP.Sodium (
         Plain,
         -- * Running FRP code
-        Reactive,
+        PReactive,
         sync,
         newEvent,
         newBehavior,
         newBehaviour,
         listen,
         -- * FRP core language
-        Event,
-        Behavior,
-        Behaviour,
+        PEvent,
+        PBehavior,
+        PBehaviour,
         never,
         merge,
         filterJust,

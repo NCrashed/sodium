@@ -110,9 +110,11 @@ class Context r => ContextIO r where
     -- Caveat: See 'executeAsyncIO'.
     executeSyncIO  :: Event r (IO a) -> Event r a
 
+instance Context r => Semigroup (Event r a) where
+    (<>) = merge
+
 instance Context r => Monoid (Event r a) where
     mempty = never
-    mappend = merge
 
 -- | A time-varying value, British spelling.
 type Behaviour r a = Behavior r a

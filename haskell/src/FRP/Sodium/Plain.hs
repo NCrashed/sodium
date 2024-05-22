@@ -27,6 +27,7 @@ import qualified Data.Set as S
 import Data.Sequence (Seq, (|>), (><))
 import qualified Data.Sequence as Seq
 import GHC.Exts
+import GHC.Base (failIO)
 import System.Mem.Weak
 import System.IO.Unsafe
 import Unsafe.Coerce
@@ -73,16 +74,16 @@ partition = unsafePerformIO createPartition
             }
 
 -- | A monad for transactional reactive operations. Execute it from 'IO' using 'sync'.
-type Reactive = R.Reactive Plain
+type PReactive = R.Reactive Plain
 
 -- | A stream of events. The individual firings of events are called \'event occurrences\'.
-type Event = R.Event Plain
+type PEvent = R.Event Plain
 
 -- | A time-varying value, American spelling.
-type Behavior = R.Behavior Plain
+type PBehavior = R.Behavior Plain
 
 -- | A time-varying value, British spelling.
-type Behaviour = R.Behavior Plain
+type PBehaviour = R.Behavior Plain
 
 -- Must be data not newtype, because we need to attach finalizers to it
 data Sample a = Sample {
@@ -98,13 +99,13 @@ instance R.Context Plain where
     data Event Plain a = Event {  -- Must be data not newtype, because we need to attach finalizers to it
             -- | Listen for event occurrences on this event, to be handled by the specified
             -- handler. The returned action is used to unregister the listener.
-            getListenRaw :: Reactive (Listen a),
+            getListenRaw :: PReactive (Listen a),
             evCacheRef   :: IORef (Maybe (Listen a)),
             eDep         :: Dep
         }
 
     data Behavior Plain a = Behavior {
-            updates_   :: Event a,  -- ^ An event that gives the updates for the behavior. It doesn't do any equality
+            updates_   :: PEvent a,  -- ^ An event that gives the updates for the behavior. It doesn't do any equality
                                     -- comparison as the name might imply.
             -- | Obtain the current value of a behavior.
             sampleImpl :: Sample a
@@ -131,7 +132,7 @@ instance R.Context Plain where
 -- | An event that gives the updates for the behavior. If the behavior was created
 -- with 'hold', then 'updates' gives you an event like to the one that was held
 -- but with only the last firing in any single transaction included.
-updates :: Behavior a -> Event a
+updates :: PBehavior a -> PEvent a
 updates = coalesce (flip const) . updates_
 
 -- | Execute the specified 'Reactive' within a new transaction, blocking the caller
@@ -139,7 +140,7 @@ updates = coalesce (flip const) . updates_
 -- This operation is thread-safe, so it may be called from any thread.
 --
 -- State changes to 'hold' values occur after processing of the transaction is complete.
-sync :: Reactive a -> IO a
+sync :: PReactive a -> IO a
 sync task = do
     let loop :: StateT ReactiveState IO () = do
             queue1 <- gets asQueue1
@@ -185,7 +186,7 @@ sync task = do
     readIORef outVar
 
 -- | Returns an event, and a push action for pushing a value into the event.
-newEvent :: Reactive (Event a, a -> Reactive ())  
+newEvent :: PReactive (PEvent a, a -> PReactive ())  
 newEvent = do
     (ev, push, _) <- ioReactive $ newEventLinked undefined
     return (ev, push)
@@ -201,11 +202,11 @@ newEvent = do
 -- that start the new transaction. If you want to do more processing in
 -- the same transction, then you can use 'FRP.Sodium.Internal.listenTrans'
 -- but this is discouraged unless you really need to write a new primitive.
-listen :: Event a -> (a -> IO ()) -> Reactive (IO ())
+listen :: PEvent a -> (a -> IO ()) -> PReactive (IO ())
 listen ev handle = listenTrans ev $ \a -> ioReactive (handle a >> touch ev)
 
 -- | An event that never fires.
-never :: Event a
+never :: PEvent a
 never = Event {
         getListenRaw = return $ Listen (\_ _ _ -> return (return ())) undefined, 
         evCacheRef   = unsafeNewIORef Nothing undefined,
@@ -219,7 +220,7 @@ never = Event {
 -- transaction. If the event firings are ordered for some reason, then
 -- their ordering is retained. In many common cases the ordering will
 -- be undefined.
-merge :: Event a -> Event a -> Event a
+merge :: PEvent a -> PEvent a -> PEvent a
 merge ea eb = Event gl cacheRef (dep (ea, eb))
   where
     cacheRef = unsafeNewIORef Nothing eb
@@ -233,7 +234,7 @@ merge ea eb = Event gl cacheRef (dep (ea, eb))
         addCleanup_Listen unlistener l
 
 -- | Unwrap Just values, and discard event occurrences with Nothing values.
-filterJust :: Event (Maybe a) -> Event a
+filterJust :: PEvent (Maybe a) -> PEvent a
 filterJust ema = Event gl cacheRef (dep ema)
   where
     cacheRef = unsafeNewIORef Nothing ema
@@ -249,7 +250,7 @@ filterJust ema = Event gl cacheRef (dep ema)
 -- is notionally the value as it was 'at the start of the transaction'.
 -- That is, state updates caused by event firings get processed at the end of
 -- the transaction.
-hold :: a -> Event a -> Reactive (Behavior a)
+hold :: a -> PEvent a -> PReactive (PBehavior a)
 hold initA ea = do
     bsRef <- ioReactive $ newIORef $ initA `seq` BehaviorState initA Nothing
     unlistener <- later $ linkedListen ea Nothing False $ \a -> do
@@ -271,7 +272,7 @@ hold initA ea = do
 -- | An event that is guaranteed to fire once when you listen to it, giving
 -- the current value of the behavior, and thereafter behaves like 'updates',
 -- firing for each update to the behavior's value.
-value :: Behavior a -> Event a
+value :: PBehavior a -> PEvent a
 value ba = sa `seq` ea `seq` eventify (listenValueRaw ba) (dep (sa, ea))
   where
     sa = sampleImpl ba
@@ -280,7 +281,7 @@ value ba = sa `seq` ea `seq` eventify (listenValueRaw ba) (dep (sa, ea))
 -- | Sample the behavior at the time of the event firing. Note that the 'current value'
 -- of the behavior that's sampled is the value as at the start of the transaction
 -- before any state changes of the current transaction are applied through 'hold's.
-snapshot :: (a -> b -> c) -> Event a -> Behavior b -> Event c
+snapshot :: (a -> b -> c) -> PEvent a -> PBehavior b -> PEvent c
 snapshot f ea bb = sample' `seq` Event gl cacheRef (dep (ea, sample))
   where
     cacheRef = unsafeNewIORef Nothing bb
@@ -294,7 +295,7 @@ snapshot f ea bb = sample' `seq` Event gl cacheRef (dep (ea, sample))
         addCleanup_Listen unlistener l
 
 -- | Unwrap an event inside a behavior to give a time-varying event implementation.
-switchE :: Behavior (Event a) -> Event a
+switchE :: PBehavior (PEvent a) -> PEvent a
 switchE bea = eea `seq` Event gl cacheRef (dep (eea, depRef))
   where
     eea      = updates bea
@@ -318,7 +319,7 @@ switchE bea = eea `seq` Event gl cacheRef (dep (eea, depRef))
         addCleanup_Listen unlistener1 l
 
 -- | Unwrap a behavior inside another behavior to give a time-varying behavior implementation.
-switch :: Behavior (Behavior a) -> Reactive (Behavior a)
+switch :: PBehavior (PBehavior a) -> PReactive (PBehavior a)
 switch bba = do
     ba <- sample bba
     depRef <- ioReactive $ newIORef ba
@@ -338,7 +339,7 @@ switch bba = do
     hold za $ finalizeEvent ev (unlisten1 >> doUnlisten2)
 
 -- | Execute the specified 'Reactive' action inside an event.
-execute :: Event (Reactive a) -> Event a
+execute :: PEvent (PReactive a) -> PEvent a
 execute ev = Event gl cacheRef (dep ev)
   where
     cacheRef = unsafeNewIORef Nothing ev
@@ -348,7 +349,7 @@ execute ev = Event gl cacheRef (dep ev)
         addCleanup_Listen unlistener l
 
 -- | Obtain the current value of a behavior.
-sample :: Behavior a -> Reactive a
+sample :: PBehavior a -> PReactive a
 {-# NOINLINE sample #-}
 sample beh = ioReactive $ do
     let sample = sampleImpl beh
@@ -364,7 +365,7 @@ sample beh = ioReactive $ do
 -- input of the combining function. In most common cases it's best not to
 -- make any assumptions about the ordering, and the combining function would
 -- ideally be commutative.
-coalesce :: (a -> a -> a) -> Event a -> Event a
+coalesce :: (a -> a -> a) -> PEvent a -> PEvent a
 coalesce combine e = Event gl cacheRef (dep e)
   where
     cacheRef = unsafeNewIORef Nothing e
@@ -383,7 +384,7 @@ coalesce combine e = Event gl cacheRef (dep e)
         addCleanup_Listen unlistener l
 
 -- | Throw away all event occurrences except for the first one.
-once :: Event a -> Event a
+once :: PEvent a -> PEvent a
 once e = Event gl cacheRef (dep e)
   where
     cacheRef = unsafeNewIORef Nothing e
@@ -406,7 +407,7 @@ once e = Event gl cacheRef (dep e)
 -- An example use case of this might be a situation where we are splitting
 -- a block of input data into frames. We obviously want each frame to have
 -- its own transaction so that state is updated separately each frame.
-split :: Event [a] -> Event a
+split :: PEvent [a] -> PEvent a
 split esa = Event gl cacheRef (dep esa)
   where
     cacheRef = unsafeNewIORef Nothing esa
@@ -419,13 +420,13 @@ split esa = Event gl cacheRef (dep esa)
 -- | Create a new 'Behavior' along with an action to push changes into it.
 -- American spelling.
 newBehavior :: a  -- ^ Initial behavior value
-            -> Reactive (Behavior a, a -> Reactive ())
+            -> PReactive (PBehavior a, a -> PReactive ())
 newBehavior = R.newBehavior
 
 -- | Create a new 'Behavior' along with an action to push changes into it.
 -- British spelling.
 newBehaviour :: a  -- ^ Initial behavior value
-            -> Reactive (Behavior a, a -> Reactive ())
+            -> PReactive (PBehavior a, a -> PReactive ())
 newBehaviour = R.newBehaviour
 
 -- | Merge two streams of events of the same type, combining simultaneous
@@ -438,31 +439,31 @@ newBehaviour = R.newBehaviour
 --
 -- The combine function should be commutative, because simultaneous events
 -- should be considered to be order-agnostic.
-mergeWith :: (a -> a -> a) -> Event a -> Event a -> Event a
+mergeWith :: (a -> a -> a) -> PEvent a -> PEvent a -> PEvent a
 mergeWith = R.mergeWith
 
 -- | Only keep event occurrences for which the predicate is true.
-filterE :: (a -> Bool) -> Event a -> Event a
+filterE :: (a -> Bool) -> PEvent a -> PEvent a
 filterE = R.filterE
 
 -- | Let event occurrences through only when the behavior's value is True.
 -- Note that the behavior's value is as it was at the start of the transaction,
 -- that is, no state changes from the current transaction are taken into account.
-gate :: Event a -> Behavior Bool -> Event a
+gate :: PEvent a -> PBehavior Bool -> PEvent a
 gate = R.gate
 
 -- | Transform an event with a generalized state loop (a mealy machine). The function
 -- is passed the input and the old state and returns the new state and output value.
-collectE :: (a -> s -> (b, s)) -> s -> Event a -> Reactive (Event b)
+collectE :: (a -> s -> (b, s)) -> s -> PEvent a -> PReactive (PEvent b)
 collectE = R.collectE
 
 -- | Transform a behavior with a generalized state loop (a mealy machine). The function
 -- is passed the input and the old state and returns the new state and output value.
-collect :: (a -> s -> (b, s)) -> s -> Behavior a -> Reactive (Behavior b)
+collect :: (a -> s -> (b, s)) -> s -> PBehavior a -> PReactive (PBehavior b)
 collect = R.collect
 
 -- | Accumulate state changes given in the input event.
-accum :: a -> Event (a -> a) -> Reactive (Behavior a)
+accum :: a -> PEvent (a -> a) -> PReactive (PBehavior a)
 accum = R.accum
 
 class PriorityQueueable k where
@@ -522,21 +523,24 @@ instance PriorityQueueable (Maybe (MVar Node)) where
     priorityOf Nothing        = return maxBound
 
 data ReactiveState = ReactiveState {
-        asQueue1 :: Seq (Reactive ()),
-        asQueue2 :: PriorityQueue (Maybe (MVar Node)) (Reactive ()),
-        asFinal  :: Seq (Reactive ()),
-        asPost   :: Seq (Reactive ())
+        asQueue1 :: Seq (PReactive ()),
+        asQueue2 :: PriorityQueue (Maybe (MVar Node)) (PReactive ()),
+        asFinal  :: Seq (PReactive ()),
+        asPost   :: Seq (PReactive ())
     }
 
 instance Functor (R.Reactive Plain) where
     fmap f rm = Reactive (fmap f (unReactive rm))
 
-unReactive :: Reactive a -> StateT ReactiveState IO a
+unReactive :: PReactive a -> StateT ReactiveState IO a
 unReactive (Reactive m) = m
 
 instance Applicative (R.Reactive Plain) where
     pure a = Reactive $ return a
     rf <*> rm = Reactive $ unReactive rf <*> unReactive rm
+
+instance MonadFail (R.Reactive Plain) where 
+    fail = Reactive . liftIO . failIO 
 
 instance Monad (R.Reactive Plain) where
     return a = Reactive $ return a
@@ -547,7 +551,7 @@ instance Monad (R.Reactive Plain) where
 instance MonadFix (R.Reactive Plain) where
     mfix f = Reactive $ mfix $ \a -> unReactive (f a)
 
-ioReactive :: IO a -> Reactive a
+ioReactive :: IO a -> PReactive a
 ioReactive io = Reactive $ liftIO io
 
 newtype NodeID = NodeID Int deriving (Eq, Ord, Enum)
@@ -558,21 +562,21 @@ data Partition = Partition {
     }
 
 -- | Queue the specified atomic to run at the end of the priority 1 queue
-scheduleEarly :: Reactive () -> Reactive ()
+scheduleEarly :: PReactive () -> PReactive ()
 scheduleEarly task = Reactive $ modify $ \as -> as { asQueue1 = asQueue1 as |> task }
 
-scheduleLast :: Reactive () -> Reactive ()
+scheduleLast :: PReactive () -> PReactive ()
 scheduleLast task = Reactive $ modify $ \as -> as { asFinal = asFinal as |> task }
 
-schedulePost :: [Reactive ()] -> Reactive ()
+schedulePost :: [PReactive ()] -> PReactive ()
 schedulePost tasks = Reactive $ modify $ \as -> as { asPost = Seq.fromList tasks >< asPost as }
 
-data Listen a = Listen { runListen_ :: Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ())
+data Listen a = Listen { runListen_ :: Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ())
                        , listenerKeepAlive :: Weak (IORef ())
                        }
 
 -- | Unwrap an event's listener machinery.
-getListen :: Event a -> Reactive (Listen a)
+getListen :: PEvent a -> PReactive (Listen a)
 getListen (Event getLRaw cacheRef _) = do
     mL <- ioReactive $ readIORef cacheRef
     case mL of
@@ -584,7 +588,7 @@ getListen (Event getLRaw cacheRef _) = do
 
 -- | Listen for firings of this event. The returned @IO ()@ is an IO action
 -- that unregisters the listener. This is the observer pattern.
-linkedListen :: Event a -> Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ())
+linkedListen :: PEvent a -> Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ())
 {-# NOINLINE linkedListen #-}
 linkedListen ev mv suppressEarlierFirings handle = do
     ioReactive $ evaluate ev
@@ -596,12 +600,12 @@ linkedListen ev mv suppressEarlierFirings handle = do
 
 -- | Variant of 'listen' that allows you to initiate more activity in the current
 -- transaction. Useful for implementing new primitives.
-listenTrans :: Event a -> (a -> Reactive ()) -> Reactive (IO ())
+listenTrans :: PEvent a -> (a -> PReactive ()) -> PReactive (IO ())
 listenTrans ev handle = linkedListen ev Nothing False handle
 
 data Observer p a = Observer {
         obNextID    :: ID,
-        obListeners :: Map ID (a -> Reactive ()),
+        obListeners :: Map ID (a -> PReactive ()),
         obFirings   :: [a]
     }
 
@@ -617,9 +621,12 @@ newNode = do
     modifyIORef (paNextNodeID partition) succ
     newMVar (Node nodeID 0 M.empty)
 
-wrap :: (Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ())) -> IO (Listen a)
+wrap :: (Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ())) -> IO (Listen a)
 {-# NOINLINE wrap #-}
-wrap l = Listen l <$> newIORef ()
+wrap l = do 
+    ref <- newIORef ()
+    wref <- mkWeakIORef ref (pure ())
+    pure $ Listen l wref
 
 touch :: a -> IO ()
 {-# NOINLINE touch #-}
@@ -661,7 +668,7 @@ dep = Dep . unsafeCoerce
 
 -- | Returns a 'Listen' for registering listeners, and a push action for pushing
 -- a value into the event.
-newEventImpl :: forall p a . IO (Listen a, a -> Reactive (), MVar Node)
+newEventImpl :: forall p a . IO (Listen a, a -> PReactive (), MVar Node)
 newEventImpl = do
     nodeRef <- newNode
     mvObs <- newMVar (Observer 0 M.empty [])
@@ -703,7 +710,7 @@ newEventImpl = do
     return (listen, push, nodeRef)
 
 -- | Returns an event, and a push action for pushing a value into the event.
-newEventLinked :: Dep -> IO (Event a, a -> Reactive (), MVar Node)
+newEventLinked :: Dep -> IO (PEvent a, a -> PReactive (), MVar Node)
 newEventLinked d = do
     (listen, push, nodeRef) <- newEventImpl
     cacheRef <- newIORef Nothing
@@ -730,7 +737,7 @@ instance Functor (R.Behavior Plain) where
         s' = unSample s
         fs = s' `seq` Sample (f `fmap` s') (dep s) Nothing
 
-constant :: a -> Behavior a
+constant :: a -> PBehavior a
 constant a = Behavior {
         updates_   = never,
         sampleImpl = Sample (return a) undefined Nothing
@@ -742,7 +749,7 @@ data BehaviorState a = BehaviorState {
     }
 
 -- | Add a finalizer to an event.
-finalizeEvent :: Event a -> IO () -> Event a
+finalizeEvent :: PEvent a -> IO () -> PEvent a
 {-# NOINLINE finalizeEvent #-}
 finalizeEvent ea unlisten = ea { getListenRaw = gl }
   where
@@ -754,8 +761,12 @@ finalizeEvent ea unlisten = ea { getListenRaw = gl }
 finalizeListen :: Listen a -> IO () -> IO (Listen a)
 {-# NOINLINE finalizeListen #-}
 finalizeListen l unlisten = do
-    wRef <- mkWeakIORef (listenerKeepAlive l) unlisten
-    return $ l { listenerKeepAlive = wRef }
+    mref <- deRefWeak $ listenerKeepAlive l 
+    case mref of 
+        Nothing -> pure l
+        Just ref -> do 
+            wRef <- mkWeakIORef ref unlisten
+            pure $ l { listenerKeepAlive = wRef }
 
 -- | Add a finalizer to a Reactive.
 finalizeSample :: Sample a -> IO () -> IO (Sample a)
@@ -770,7 +781,7 @@ newtype Unlistener = Unlistener (MVar (Maybe (IO ())))
 
 -- | Perform a listen later so we can tolerate lazy loops.
 -- Returns an 'Unlistener' that can be attached to an event with 'addCleanup_Listen'.
-later :: Reactive (IO ()) -> Reactive Unlistener
+later :: PReactive (IO ()) -> PReactive Unlistener
 later doListen = do
     unlistener@(Unlistener ref) <- newUnlistener
     -- We schedule the actual listen rather than doing it now, so event values get
@@ -784,12 +795,12 @@ later doListen = do
             Nothing -> ioReactive $ putMVar ref mOldUnlisten
     return unlistener
   where
-    newUnlistener :: Reactive Unlistener
+    newUnlistener :: PReactive Unlistener
     newUnlistener = Unlistener <$> ioReactive (newMVar (Just $ return ()))
 
 -- | Cause the things listened to with 'later' to be unlistened when the
 -- specified listener is not referenced any more.
-addCleanup_Listen :: Unlistener -> Listen a -> Reactive (Listen a)
+addCleanup_Listen :: Unlistener -> Listen a -> PReactive (Listen a)
 addCleanup_Listen (Unlistener ref) l = ioReactive $ finalizeListen l $ do
     mUnlisten <- takeMVar ref
     fromMaybe (return ()) mUnlisten
@@ -807,7 +818,7 @@ addCleanup_Sample (Unlistener ref) s = finalizeSample s $ do
 -- the current value. Can get multiple values per transaction, the last of
 -- which is considered valid. You would normally want to use 'listenValue',
 -- which removes the extra unwanted values.
-listenValueRaw :: Behavior a -> Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ())
+listenValueRaw :: PBehavior a -> Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ())
 listenValueRaw ba = lastFiringOnly $ \mNodeRef suppressEarlierFirings handle -> do
     a <- sample ba
     handle a
@@ -815,21 +826,21 @@ listenValueRaw ba = lastFiringOnly $ \mNodeRef suppressEarlierFirings handle -> 
 
 -- | Queue the specified atomic to run at the end of the priority 2 queue
 schedulePrioritized :: Maybe (MVar Node)
-                    -> Reactive ()
-                    -> Reactive ()
+                    -> PReactive ()
+                    -> PReactive ()
 schedulePrioritized mNodeRef task = Reactive $ do
     q <- gets asQueue2
     lift $ pushPriorityQueue q mNodeRef task
 
-dirtyPrioritized :: Reactive ()
+dirtyPrioritized :: PReactive ()
 dirtyPrioritized = Reactive $ do
     q <- gets asQueue2
     lift $ dirtyPriorityQueue q
 
 -- Clean up the listener so it gives only one value per transaction, specifically
 -- the last one.
-lastFiringOnly :: (Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ()))
-                -> Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ())
+lastFiringOnly :: (Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ()))
+                -> Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ())
 lastFiringOnly listen mNodeRef suppressEarlierFirings handle = do
     aRef <- ioReactive $ newIORef Nothing
     listen mNodeRef suppressEarlierFirings $ \a -> do
@@ -840,7 +851,7 @@ lastFiringOnly listen mNodeRef suppressEarlierFirings handle = do
             ioReactive $ writeIORef aRef Nothing
             handle a
 
-eventify :: (Maybe (MVar Node) -> Bool -> (a -> Reactive ()) -> Reactive (IO ())) -> Dep -> Event a
+eventify :: (Maybe (MVar Node) -> Bool -> (a -> PReactive ()) -> PReactive (IO ())) -> Dep -> PEvent a
 eventify listen d = Event gl cacheRef d
   where
     cacheRef = unsafeNewIORef Nothing listen
@@ -893,26 +904,26 @@ cross bpa = do
 
 -- | An event that gives the updates for the behavior. If the behavior was created
 -- with 'hold', then 'changes' gives you an event equivalent to the one that was held.
-changes :: Behavior a -> Event a
+changes :: PBehavior a -> PEvent a
 {-# DEPRECATED changes "renamed to 'updates'" #-}
 changes = updates
 
 -- | An event that is guaranteed to fire once when you listen to it, giving
 -- the current value of the behavior, and thereafter behaves like 'changes',
 -- firing for each update to the behavior's value.
-values :: Behavior a -> Event a
+values :: PBehavior a -> PEvent a
 {-# DEPRECATED values "renamed to 'value'" #-}
 values = value
 
 -- | Sample the behavior at the time of the event firing. Note that the 'current value'
 -- of the behavior that's sampled is the value as at the start of the transaction
 -- before any state changes of the current transaction are applied through 'hold's.
-snapshotWith :: (a -> b -> c) -> Event a -> Behavior b -> Event c
+snapshotWith :: (a -> b -> c) -> PEvent a -> PBehavior b -> PEvent c
 {-# DEPRECATED snapshotWith "renamed to 'snapshot'" #-}
 snapshotWith = snapshot
 
 -- | Count event occurrences, giving a behavior that starts with 0 before the first occurrence.
-count :: Event a -> Reactive (Behavior Int)
+count :: PEvent a -> PReactive (PBehavior Int)
 {-# DEPRECATED count "removing it in the pursuit of minimalism, replace with: accum 0 (const (1+) <$> e)" #-}
 count = accum 0 . (const (1+) <$>)
 
